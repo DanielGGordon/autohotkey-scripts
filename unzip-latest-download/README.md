@@ -12,6 +12,8 @@ need to open the Downloads folder, right-click "Extract All" or browse to the de
    - **Downloads folder**: filled in with your Windows Downloads folder (including one you have
      moved). Change it if your browser saves somewhere else.
    - **Hotkey**: Ctrl+Shift+U unless you pick another.
+   - **Unzip with**: [7-Zip](https://www.7-zip.org/) if it is installed, otherwise Windows' own
+     zip support.
    - **Start automatically when I sign in to Windows**: tick this to keep it running.
 
 The script then sits in the tray (the green **H** icon). Right-click that icon and choose
@@ -23,7 +25,7 @@ The script then sits in the tray (the green **H** icon). Right-click that icon a
 2. Press **Ctrl+Shift+U**.
 
 The newest zip in your Downloads folder is unzipped there, and the result is selected in
-Explorer. Windows shows its usual progress window for big zips.
+Explorer. 7-Zip (or Windows) shows its usual progress window for big zips.
 
 The hotkey only works in File Explorer and on the desktop. In every other program, Ctrl+Shift+U
 does whatever it normally does.
@@ -49,10 +51,22 @@ downloaded (created) or last modified. Zips still downloading in Firefox (a `.pa
 them) and empty zips are skipped. Chrome and Edge give a download its real name only once it is
 finished, so a zip still downloading in those browsers isn't counted either.
 
+## 7-Zip or Windows
+
+If [7-Zip](https://www.7-zip.org/) is installed, it does the unzipping. It is faster and also
+opens zips that Windows can't, such as password-protected ones (7-Zip asks for the password).
+Without 7-Zip, Windows' built-in zip support is used, the same as "Extract All". The
+notification after each unzip says which one was used.
+
+7-Zip is found wherever it is installed (it is looked up in the registry). Installing or
+removing it takes effect on the next unzip; there's nothing to restart. To always use Windows,
+choose **Always Windows' built-in zip support** in Settings.
+
+Either way, files from the internet stay marked as downloaded, so Windows still warns before
+running them (for 7-Zip this needs version 22 or later).
+
 ## Good to know
 
-- It uses Windows' own zip support, so files from the internet stay marked as downloaded
-  (Windows still warns before running them), exactly as with "Extract All".
 - Zips are unzipped into a temporary `Unzipping <name>` folder first, which you may see briefly
   for big zips. The files are then moved into place.
 - It works in a real folder, such as on your PC, a USB drive or a network share. It can't unzip
