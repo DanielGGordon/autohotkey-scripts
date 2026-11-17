@@ -4,8 +4,9 @@
 ; Downloads folder is unzipped into the folder you are looking at.
 ;
 ; AutoHotkey v2.0 or later. No other dependencies.
-; Settings (Downloads folder, hotkey, where the files go) are in the tray icon's "Settings..." and
-; are saved to %APPDATA%\Unzip Latest Download\settings.ini.
+; Unzips with 7-Zip when it is installed, otherwise with Windows' own zip support.
+; Settings (Downloads folder, hotkey, where the files go, 7-Zip or Windows) are in the tray
+; icon's "Settings..." and are saved to %APPDATA%\Unzip Latest Download\settings.ini.
 ; https://github.com/DanielGGordon/autohotkey-scripts
 
 #Requires AutoHotkey v2.0
@@ -21,13 +22,15 @@ App := {
 ; Current settings (loaded below).
 global DownloadsFolder := ""
 global ExtractMode := "auto"       ; auto | folder | here (see ShowSettings)
+global Unzipper := "auto"          ; auto (7-Zip if installed, else Windows) | windows
 global CurrentHotkey := ""
 
 Main()
 
 Main() {
-    global DownloadsFolder, ExtractMode
+    global DownloadsFolder, ExtractMode, Unzipper
     DownloadsFolder := IniRead(App.Ini, "Settings", "DownloadsFolder", "")
+    Unzipper := IniRead(App.Ini, "Settings", "Unzipper", "auto") = "windows" ? "windows" : "auto"
     ExtractMode := IniRead(App.Ini, "Settings", "ExtractMode", "auto")
     if !(ExtractMode ~= "i)^(auto|folder|here)$")
         ExtractMode := "auto"
@@ -96,6 +99,8 @@ UnzipLatestDownload(*) {
     SplitPath zip, &zipName
     try {
         result := ExtractZip(zip, target.path)
+    } catch Cancelled {
+        return                                   ; you pressed Cancel in 7-Zip's window
     } catch as err {
         MsgBox "Could not unzip`n`n" zip "`n`n" err.Message, App.Name, "Icon!"
         return
@@ -103,7 +108,7 @@ UnzipLatestDownload(*) {
 
     if target.view && result.select != ""
         SelectInExplorer(target.view, result.select)
-    Notify("Unzipped " zipName, "into " result.dest, "Iconi")
+    Notify("Unzipped " zipName, "into " result.dest " (with " result.tool ")", "Iconi")
 }
 
 ; ---------------------------------------------------------------------------------------------
@@ -162,41 +167,43 @@ NewestZip(folder) {
     return newest
 }
 
-; Unzips with Windows' own zip support, so you get Explorer's progress window and files
-; downloaded from the internet stay marked as such (Windows still warns before running them).
-; The zip is first unzipped into a new "Unzipping <name>" folder and its contents are then moved
-; into place, so nothing that is already there is ever overwritten: a name that is taken gets
-; " (2)", " (3)", ... added.
-; Returns {dest: folder the files went into, select: name to select in Explorer afterwards}.
+; Unzips into a new "Unzipping <name>" folder first and then moves the contents into place, so
+; nothing that is already there is ever overwritten: a name that is taken gets " (2)", " (3)",
+; ... added. If anything goes wrong, that temporary folder is removed again.
+; Returns {dest: folder the files went into, select: name to select in Explorer afterwards,
+; tool: "7-Zip" or "Windows"}.
 ExtractZip(zipPath, destFolder) {
-    shell := ComObject("Shell.Application")
-    zipNs := shell.NameSpace(zipPath)
-    if !IsObject(zipNs)
-        throw Error("Windows could not open it as a zip file. It may be damaged or not a real zip.")
-    items := zipNs.Items()
-    if items.Count = 0
-        throw Error("The zip file is empty.")
-
     SplitPath zipPath, , , , &baseName
     temp := UniquePath(destFolder, "Unzipping " baseName, true)
     DirCreate temp
-    tempNs := shell.NameSpace(temp)
-    if !IsObject(tempNs)
-        throw Error("Windows could not open the folder " temp)
-    tempNs.CopyHere(items, 0)        ; returns when the unzipping is done
+    sevenZip := Unzipper = "windows" ? "" : Find7Zip()
+    try {
+        if sevenZip
+            UnzipWith7Zip(sevenZip, zipPath, temp)
+        else
+            UnzipWithWindows(zipPath, temp)
+        found := []
+        Loop Files temp "\*", "FD"
+            found.Push({path: A_LoopFileFullPath, name: A_LoopFileName, isDir: InStr(A_LoopFileAttrib, "D")})
+        if found.Length = 0
+            throw Error("The zip file is empty.")
+    } catch as err {
+        try DirDelete temp, true
+        ShellNotify(0x10, temp)          ; SHCNE_RMDIR
+        throw err
+    }
+    tool := sevenZip ? "7-Zip" : "Windows"
 
-    if ExtractMode = "folder" || (ExtractMode = "auto" && items.Count > 1) {
+    if ExtractMode = "folder" || (ExtractMode = "auto" && found.Length > 1) {
         ; Into a new folder named after the zip, so loose files don't spill everywhere.
         dest := UniquePath(destFolder, baseName, true)
         DirMove temp, dest
-        return {dest: dest, select: LeafName(dest)}
+        ShellNotify(0x20000, temp, dest) ; SHCNE_RENAMEFOLDER
+        return {dest: dest, select: LeafName(dest), tool: tool}
     }
 
     ; Straight into the current folder. A zip that holds one folder (the usual case) ends up
     ; as that one folder.
-    found := []
-    Loop Files temp "\*", "FD"
-        found.Push({path: A_LoopFileFullPath, name: A_LoopFileName, isDir: InStr(A_LoopFileAttrib, "D")})
     moved := []
     for f in found {
         target := UniquePath(destFolder, f.name, f.isDir)
@@ -207,9 +214,74 @@ ExtractZip(zipPath, destFolder) {
         moved.Push(LeafName(target))
     }
     try DirDelete temp               ; only if empty
-    if moved.Length = 0
-        throw Error("Nothing was unzipped.")
-    return {dest: destFolder, select: moved.Length = 1 ? moved[1] : ""}
+    ShellNotify(0x10, temp)          ; SHCNE_RMDIR
+    return {dest: destFolder, select: moved.Length = 1 ? moved[1] : "", tool: tool}
+}
+
+; Tells open Explorer windows about a change right away. Explorer sometimes misses a folder that
+; is created and removed again within a second and keeps showing it until you press F5.
+ShellNotify(event, path, path2 := "") {
+    DllCall("shell32\SHChangeNotify", "Int", event, "UInt", 0x1005, "WStr", path    ; SHCNF_PATHW | SHCNF_FLUSH
+        , path2 = "" ? "Ptr" : "WStr", path2 = "" ? 0 : path2)
+}
+
+; Thrown when you cancel 7-Zip's progress window: nothing to report.
+class Cancelled extends Error {
+}
+
+; 7-Zip's own window shows the progress, asks for the password of an encrypted zip and reports
+; any error. Files downloaded from the internet stay marked as such (-snz, 7-Zip 22 and later).
+UnzipWith7Zip(sevenZip, zipPath, toFolder) {
+    exe := sevenZip.gui != "" ? sevenZip.gui : sevenZip.cli
+    cmd := '"' exe '" x "' zipPath '" -o"' toFolder '" -y'
+    if sevenZip.version >= 22
+        cmd .= " -snz"
+    code := RunWait(cmd, , sevenZip.gui != "" ? "" : "Hide")
+    if code = 255
+        throw Cancelled()
+    if code > 1                      ; 1 = warnings only, the files are there
+        throw Error("7-Zip could not unzip it (error " code "). The zip may be damaged, "
+            . "or the password was wrong.")
+}
+
+; Windows' own zip support: Explorer's progress window, and files downloaded from the internet
+; stay marked as such (Windows still warns before running them).
+UnzipWithWindows(zipPath, toFolder) {
+    shell := ComObject("Shell.Application")
+    zipNs := shell.NameSpace(zipPath)
+    if !IsObject(zipNs)
+        throw Error("Windows could not open it as a zip file. It may be damaged or not a real zip.")
+    items := zipNs.Items()
+    if items.Count = 0
+        throw Error("The zip file is empty.")
+    toNs := shell.NameSpace(toFolder)
+    if !IsObject(toNs)
+        throw Error("Windows could not open the folder " toFolder)
+    toNs.CopyHere(items, 0)          ; returns when the unzipping is done
+}
+
+; 7-Zip's install folder, from its registry entry or the usual places. Returns "" when it is not
+; installed, else {dir, gui: 7zG.exe (has a window) or "", cli: 7z.exe or "", version: major}.
+Find7Zip() {
+    dirs := []
+    for key in ["HKLM\SOFTWARE\7-Zip", "HKCU\SOFTWARE\7-Zip", "HKLM\SOFTWARE\WOW6432Node\7-Zip"]
+        for value in ["Path64", "Path"]
+            try dirs.Push(RegRead(key, value))
+    for env in ["ProgramW6432", "ProgramFiles", "ProgramFiles(x86)"]
+        if EnvGet(env) != ""
+            dirs.Push(EnvGet(env) "\7-Zip")
+
+    for dir in dirs {
+        dir := RTrim(dir, "\")
+        gui := FileExist(dir "\7zG.exe") ? dir "\7zG.exe" : ""
+        cli := FileExist(dir "\7z.exe") ? dir "\7z.exe" : ""
+        if gui = "" && cli = ""
+            continue
+        version := 0
+        try version := Integer(StrSplit(FileGetVersion(gui != "" ? gui : cli), ".")[1])
+        return {dir: dir, gui: gui, cli: cli, version: version}
+    }
+    return ""
 }
 
 ; folder\name, or "name (2)", "name (3)", ... if that is taken. For a file the number goes
@@ -299,6 +371,15 @@ ShowSettings(firstRun := false) {
     ])
     dd.Value := Max(1, IndexOf(modes, ExtractMode))
 
+    g.AddText("xm y+16", "Unzip with:")
+    ddTool := g.AddDropDownList("xm w470", [
+        "7-Zip if it is installed, otherwise Windows (recommended)",
+        "Always Windows' built-in zip support",
+    ])
+    ddTool.Value := Unzipper = "windows" ? 2 : 1
+    sevenZip := Find7Zip()
+    g.AddText("xm y+4 cGray", sevenZip ? "7-Zip found in " sevenZip.dir : "7-Zip is not installed.")
+
     cb := g.AddCheckbox("xm y+16", "Start automatically when I sign in to Windows")
     cb.Value := FileExist(App.StartupLink) ? 1 : 0
 
@@ -319,7 +400,7 @@ ShowSettings(firstRun := false) {
     Reset(*) => edFolder.Value := DefaultDownloadsFolder()
 
     Save(*) {
-        global DownloadsFolder, ExtractMode
+        global DownloadsFolder, ExtractMode, Unzipper
         g.Opt("+OwnDialogs")
         folder := Trim(edFolder.Value)
         if folder ~= "\\$" && StrLen(folder) > 3
@@ -340,10 +421,12 @@ ShowSettings(firstRun := false) {
 
         DownloadsFolder := folder
         ExtractMode := modes[dd.Value]
+        Unzipper := ddTool.Value = 2 ? "windows" : "auto"
         DirCreate RegExReplace(App.Ini, "\\[^\\]+$")
         IniWrite DownloadsFolder, App.Ini, "Settings", "DownloadsFolder"
         IniWrite CurrentHotkey, App.Ini, "Settings", "Hotkey"
         IniWrite ExtractMode, App.Ini, "Settings", "ExtractMode"
+        IniWrite Unzipper, App.Ini, "Settings", "Unzipper"
 
         if cb.Value
             CreateStartupLink()
